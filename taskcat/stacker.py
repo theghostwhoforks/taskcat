@@ -27,7 +27,6 @@ import os
 import random
 import re
 import sys
-import textwrap
 import time
 import uuid
 import boto3
@@ -35,12 +34,11 @@ import pyfiglet
 import yaml
 import logging
 import cfnlint.core
+import textwrap
 from argparse import RawTextHelpFormatter
 from botocore.vendored import requests
 
 from pkg_resources import get_distribution
-from functools import partial
-from multiprocessing.dummy import Pool as ThreadPool
 
 from taskcat.reaper import Reaper
 from taskcat.client_factory import ClientFactory
@@ -48,8 +46,9 @@ from taskcat.colored_console import PrintMsg
 from taskcat.generate_reports import ReportBuilder
 from taskcat.common_utils import CommonTools
 from taskcat.cfn_logutils import CfnLogTools
+from taskcat.cfn_resources import CfnResourceTools
 from taskcat.exceptions import TaskCatException
-from taskcat.common_utils import exit1
+from taskcat.s3_sync import S3Sync
 from taskcat.common_utils import exit0
 
 
@@ -184,14 +183,17 @@ class TaskCat(object):
         self._boto_profile = None
         self._boto_client = ClientFactory(logger=logger)
         self._key_url_map = {}
-        self.multithread_upload = False
         self.retain_if_failed = False
         self.tags = []
         self.stack_prefix = ''
         self.template_data = None
         self.version = get_installed_version()
+        self.s3_url_prefix = ""
+        self.upload_only = False
+        self._max_bucket_name_length = 63
+        self.lambda_build_only = False
 
-    # SETTERS ANPrintMsg.DEBUG GETTERS
+        # SETTERS ANPrintMsg.DEBUG GETTERS
     # ===================
 
     def set_project(self, project):
@@ -199,12 +201,6 @@ class TaskCat(object):
 
     def get_project(self):
         return self.project
-
-    def set_multithread_upload(self, multithread_upload):
-        self.multithread_upload = multithread_upload
-
-    def get_multithread_upload(self):
-        return self.multithread_upload
 
     def set_owner(self, owner):
         self.owner = owner
@@ -341,9 +337,9 @@ class TaskCat(object):
             if _kn in param_index:
                 _knidx = param_index[_kn]
                 param_bucket_name = original_keys[_knidx]['ParameterValue']
-                if param_bucket_name != bucket_name:
+                if param_bucket_name != bucket_name and param_bucket_name != '$[taskcat_autobucket]':
                     print(
-                        PrintMsg.INFO + "Data inconsistency between S3 Bucket Name [{}] and QSS3BucketName Parameter Value: [{}]".format(
+                        PrintMsg.INFO + "Inconsistency detected between S3 Bucket Name provided in the TaskCat Config [{}] and QSS3BucketName Parameter Value within the template: [{}]".format(
                             bucket_name, param_bucket_name))
                     print(PrintMsg.INFO + "Setting the value of QSS3BucketName to [{}]".format(bucket_name))
                     original_keys[_knidx]['ParameterValue'] = bucket_name
@@ -409,13 +405,23 @@ class TaskCat(object):
         s3_client = self._boto_client.get('s3', region=self.get_default_region(), s3v4=True)
         self.set_project(taskcat_cfg['global']['qsname'])
 
-        # TODO Update to alchemist upload
         if 's3bucket' in taskcat_cfg['global'].keys():
             self.set_s3bucket(taskcat_cfg['global']['s3bucket'])
             self.set_s3bucket_type('defined')
             print(PrintMsg.INFO + "Staging Bucket => " + self.get_s3bucket())
+            if len(self.get_s3bucket()) > self._max_bucket_name_length:
+                raise TaskCatException("The bucket name you provided is greater than 63 characters.")
+            try:
+                _ = s3_client.list_objects(Bucket=self.get_s3bucket())
+            except s3_client.exceptions.NoSuchBucket:
+                raise TaskCatException("The bucket you provided [{}] does not exist. Exiting.".format(self.get_s3bucket()))
+            except Exception:
+                raise
         else:
             auto_bucket = 'taskcat-' + self.stack_prefix + '-' + self.get_project() + "-" + jobid[:8]
+            auto_bucket = auto_bucket.lower()
+            if len(auto_bucket) > self._max_bucket_name_length:
+                auto_bucket = auto_bucket[:self._max_bucket_name_length]
             if self.get_default_region():
                 print('{0}Creating bucket {1} in {2}'.format(PrintMsg.INFO, auto_bucket, self.get_default_region()))
                 if self.get_default_region() == 'us-east-1':
@@ -450,53 +456,19 @@ class TaskCat(object):
                     Bucket=auto_bucket,
                     Tagging={"TagSet": self.tags}
                 )
-        # TODO Remove after alchemist is implemented
 
         if os.path.isdir(self.get_project()):
-            current_dir = "."
             start_location = "{}/{}".format(".", self.get_project())
-            fsmap = buildmap(current_dir, start_location, partial_match=False)
         else:
-
             print('''\t\t Hint: The name specfied as value of qsname ({})
                     must match the root directory of your project'''.format(self.get_project()))
             print("{0}!Cannot find directory [{1}] in {2}".format(PrintMsg.ERROR, self.get_project(), os.getcwd()))
             raise TaskCatException("Please cd to where you project is located")
 
-        if self.multithread_upload:
-            threads = 16
-            print(PrintMsg.INFO + "Multithread upload enabled, spawning %s threads" % threads)
-            pool = ThreadPool(threads)
-            func = partial(self._s3_upload_file, s3_client=s3_client, bucket_or_object_acl=bucket_or_object_acl)
-            pool.map(func, fsmap)
-            pool.close()
-            pool.join()
-        else:
-            for filename in fsmap:
-                self._s3_upload_file(filename, s3_client=s3_client, bucket_or_object_acl=bucket_or_object_acl)
-
-        paginator = s3_client.get_paginator('list_objects')
-        operation_parameters = {'Bucket': self.get_s3bucket(), 'Prefix': self.get_project()}
-        s3_pages = paginator.paginate(**operation_parameters)
-
-        for s3keys in s3_pages.search('Contents'):
-            print("{}[S3: -> ]{} s3://{}/{}".format(PrintMsg.white, PrintMsg.rst_color, self.get_s3bucket(),
-                                                    s3keys.get('Key')))
-        print("{} |Contents of S3 Bucket {} {}".format(self.nametag, PrintMsg.header, PrintMsg.rst_color))
-
-        print('\n')
-
-    def _s3_upload_file(self, filename, s3_client, bucket_or_object_acl):
-        upload = re.sub('^./', '', filename)
-        try:
-            s3_client.upload_file(filename, self.get_s3bucket(), upload, ExtraArgs={'ACL': bucket_or_object_acl})
-        except TaskCatException:
-            raise
-        except Exception as e:
-            print("Cannot Upload to bucket => %s" % self.get_s3bucket())
-            if self.verbose:
-                print(PrintMsg.DEBUG + str(e))
-            raise TaskCatException("Check that you bucketname is correct")
+        S3Sync(s3_client, self.get_s3bucket(), self.get_project(), start_location, bucket_or_object_acl)
+        self.s3_url_prefix = "https://" + self.get_s3_hostname() + "/" + self.get_project()
+        if self.upload_only:
+            exit0("Upload completed successfully")
 
     def get_available_azs(self, region, count):
         """
@@ -559,45 +531,31 @@ class TaskCat(object):
         key = self._key_url_map[url]
         return self.get_content(self.get_s3bucket(), key)
 
-    def get_s3_url(self, key):
+    def get_contents(self, path):
         """
-        Returns S3 url of a given object.
+        Returns local file contents as a string.
 
-        :param key: Name of the object whose S3 url is being returned
-        :return: S3 url of the given key
+        :param path: URL of the S3 object to return.
+        :return: file contents
+        """
+        with open(path, 'r') as f:
+            data = f.read()
+        return data
+
+    def get_s3_hostname(self):
+        """
+        Returns S3 hostname of target bucket
+        :return: S3 hostname
 
         """
         s3_client = self._boto_client.get('s3', region=self.get_default_region(), s3v4=True)
         bucket_location = s3_client.get_bucket_location(Bucket=self.get_s3bucket())
-        _project_s3_prefix = self.get_project()
-        paginator = s3_client.get_paginator('list_objects')
-        operation_parameters = {'Bucket': self.get_s3bucket(), 'Prefix': _project_s3_prefix}
-        page_iterator = paginator.paginate(**operation_parameters)
-        for page in page_iterator:
-            for s3obj in (page['Contents']):
-                for metadata in s3obj.items():
-                    if metadata[0] == 'Key':
-                        if key in metadata[1]:
-                            # Finding exact match
-                            terms = metadata[1].split("/")
-                            _found_prefix = terms[0]
-                            # issues/
-                            if (key == terms[-1]) and (_found_prefix == _project_s3_prefix):
-                                if bucket_location[
-                                    'LocationConstraint'
-                                ] is not None:
-                                    o_url = "https://s3-{0}.{1}/{2}/{3}".format(
-                                        bucket_location['LocationConstraint'],
-                                        "amazonaws.com",
-                                        self.get_s3bucket(),
-                                        metadata[1])
-                                    self._key_url_map.update({o_url: metadata[1]})
-                                    return o_url
-                                else:
-                                    amzns3 = 's3.amazonaws.com'
-                                    o_url = "https://{1}.{0}/{2}".format(amzns3, self.get_s3bucket(), metadata[1])
-                                    self._key_url_map.update({o_url: metadata[1]})
-                                    return o_url
+        if bucket_location['LocationConstraint'] is not None:
+            hostname = "s3-{0}.{1}/{2}".format(bucket_location['LocationConstraint'], "amazonaws.com",
+                                               self.get_s3bucket())
+        else:
+            hostname = "{0}.s3.amazonaws.com".format(self.get_s3bucket())
+        return hostname
 
     def get_global_region(self, yamlcfg):
         """
@@ -610,19 +568,16 @@ class TaskCat(object):
         g_regions = []
         for keys in yamlcfg['global'].keys():
             if 'region' in keys:
+                namespace = 'global'
                 try:
                     iter(yamlcfg['global']['regions'])
-                    namespace = 'global'
                     for region in yamlcfg['global']['regions']:
-                        # print("found region %s" % region)
                         g_regions.append(region)
                         self._use_global = True
-                except TypeError:
-                    print("No regions defined in [%s]:" % namespace)
-                    print("Please correct region defs[%s]:" % namespace)
+                except TypeError as e:
+                    print(PrintMsg.ERROR + "No regions defined in [%s]:" % namespace)
+                    print(PrintMsg.ERROR + "Please correct region defs[%s]:" % namespace)
         return g_regions
-
-
 
     def extract_template_parameters(self):
         """
@@ -651,8 +606,7 @@ class TaskCat(object):
                     print(PrintMsg.DEBUG + "Default region [%s]" % self.get_default_region())
                 cfn = self._boto_client.get('cloudformation', region=self.get_default_region())
 
-                cfn.validate_template(TemplateURL=self.get_s3_url(self.get_template_file()))
-                result = cfn.validate_template(TemplateURL=self.get_s3_url(self.get_template_file()))
+                result = cfn.validate_template(TemplateURL=self.s3_url_prefix + '/templates/' + self.get_template_file())
                 print(PrintMsg.PASS + "Validated [%s]" % self.get_template_file())
                 if 'Description' in result:
                     cfn_result = (result['Description'])
@@ -1077,7 +1031,7 @@ class TaskCat(object):
                 print(PrintMsg.INFO + "Preparing to launch in region [%s] " % region)
                 try:
                     cfn = self._boto_client.get('cloudformation', region=region)
-                    s_parmsdata = self.get_s3contents(self.get_parameter_path())
+                    s_parmsdata = self.get_contents("./" + self.get_project() + "/ci/" + self.get_parameter_file())
                     s_parms = json.loads(s_parmsdata)
                     s_include_params = self.get_param_includes(s_parms)
                     if s_include_params:
@@ -1095,7 +1049,6 @@ class TaskCat(object):
                             print(json.dumps(j_params, sort_keys=True, indent=11, separators=(',', ': ')))
 
                     try:
-                        print(PrintMsg.INFO + "|CFN Execution mode [create_stack]")
                         stackdata = cfn.create_stack(
                             StackName=stackname,
                             DisableRollback=True,
@@ -1104,9 +1057,10 @@ class TaskCat(object):
                             Capabilities=self.get_capabilities(),
                             Tags=self.tags
                         )
-                    except TaskCatException:
-                        raise
-                    except:
+                        print(PrintMsg.INFO + "|CFN Execution mode [create_stack]")
+                    except cfn.exceptions.ClientError as e:
+                        if not str(e).endswith('cannot be used with templates containing Transforms.'):
+                            raise
                         print(PrintMsg.INFO + "|CFN Execution mode [change_set]")
                         stack_cs_data = cfn.create_change_set(
                             StackName=stackname,
@@ -1127,7 +1081,7 @@ class TaskCat(object):
                                 'MaxAttempts': 26  # max lambda execute is 5 minutes
                             })
 
-                        stack_ex_data = cfn.execute_change_set(
+                        cfn.execute_change_set(
                             ChangeSetName=change_set_name
                         )
 
@@ -1171,7 +1125,7 @@ class TaskCat(object):
             if self.verbose:
                 print(PrintMsg.DEBUG + "parameter_path = %s" % self.get_parameter_path())
 
-            inputparms = self.get_s3contents(self.get_parameter_path())
+            inputparms = self.get_contents("./" + self.get_project() + "/ci/" + self.get_parameter_file())
             jsonstatus = self.check_json(inputparms)
 
             if self.verbose:
@@ -1392,7 +1346,8 @@ class TaskCat(object):
             region = stackdata['region']
             session = boto3.session.Session(region_name=region)
             s = Reaper(session)
-            failed_stacks = self.get_all_resources(failed_stack_ids, region)
+
+            failed_stacks = CfnResourceTools(self._boto_client).get_all_resources(failed_stack_ids, region)
             # print all resources which failed to delete
             if self.verbose:
                 print(PrintMsg.DEBUG + "Resources which failed to delete:\n")
@@ -1489,7 +1444,6 @@ class TaskCat(object):
                 p = yamlc['tests'][test]['parameter_input']
                 n = yamlc['global']['qsname']
                 o = yamlc['global']['owner']
-                b = self.get_s3bucket()
 
                 # Checks if cleanup flag is set
                 # If cleanup is set to 'false' stack will not be deleted after
@@ -1516,15 +1470,12 @@ class TaskCat(object):
                             print(PrintMsg.INFO + " - (Defaulting to cleanup)")
 
                 # Load test setting
-                self.set_s3bucket(b)
                 self.set_project(n)
                 self.set_owner(o)
                 self.set_template_file(t)
                 self.set_parameter_file(p)
-                self.set_template_path(
-                    self.get_s3_url(self.get_template_file()))
-                self.set_parameter_path(
-                    self.get_s3_url(self.get_parameter_file()))
+                self.set_template_path(self.s3_url_prefix + '/templates/' + self.get_template_file())
+                self.set_parameter_path(self.s3_url_prefix + '/ci/' + self.get_parameter_file())
 
                 # Check to make sure template filenames are correct
                 template_path = self.get_template_path()
@@ -1544,7 +1495,7 @@ class TaskCat(object):
 
                 # Detect template type
 
-                cfntemplate = self.get_s3contents(self.get_s3_url(self.get_template_file()))
+                cfntemplate = self.get_contents("./" + self.get_project() + '/templates/' + self.get_template_file())
 
                 if self.check_json(cfntemplate, quiet=True, strict=False):
                     self.set_template_type('json')
@@ -1653,96 +1604,6 @@ class TaskCat(object):
                 raise TaskCatException(str(e))
             return False
         return True
-
-    def lint(self, strict='warn', path=''):
-        """
-        Lints all templates (against each region to be tested) using cfn_python_lint
-
-        :param path:
-        :param strict: string, "error" outputs a log line for each warning and fails on errors, if set to "strict"
-        will exit on warnings and failures, if set to "warn" will only output warnings for errors
-        :return:
-        """
-        if strict not in ['error', 'strict', 'warn']:
-            raise TaskCatException("lint was set to an invalid value '%s', valid values are: 'error', 'strict', 'warn'" % strict)
-        lints = {}
-        templates = {}
-        config = yaml.safe_load(open(self.config))
-        rules = cfnlint.core.get_rules([], [])
-        for test in config['tests'].keys():
-            lints[test] = {}
-            if 'regions' in config['tests'][test].keys():
-                lints[test]['regions'] = config['tests'][test]['regions']
-            else:
-                lints[test]['regions'] = config['global']['regions']
-            if path:
-                template_file = '%s/templates/%s' % (path, config['tests'][test]['template_file'])
-            else:
-                template_file = 'templates/%s' % (config['tests'][test]['template_file'])
-            lints[test]['template_file'] = template_file
-            if template_file not in templates.keys():
-                templates[template_file] = self.get_child_templates(template_file, parent_path=path)
-            lints[test]['results'] = {}
-            templates[template_file].add(template_file)
-            for t in templates[template_file]:
-                template = cfnlint.decode.cfn_yaml.load(t)
-                lints[test]['results'][t] = cfnlint.core.run_checks(
-                    t,
-                    template,
-                    rules,
-                    lints[test]['regions'])
-        test_status = {"W": False, "E": False}
-        for test in lints.keys():
-            for t in lints[test]['results'].keys():
-                print(PrintMsg.INFO + "Lint results for test %s on template %s:" % (test, t))
-                for r in lints[test]['results'][t]:
-                    message = r.__str__().lstrip('[')
-                    sev = message[0]
-                    if sev == 'E':
-                        print(PrintMsg.ERROR + "    " + message)
-                        test_status[sev] = True
-                    elif sev == 'W':
-                        if 'E' + message[1:] not in [r.__str__().lstrip('[') for r in lints[test]['results'][t]]:
-                            print(PrintMsg.INFO + "    " + message)
-                            test_status[sev] = True
-                    else:
-                        print(PrintMsg.DEBUG + "linter produced unkown output: " + message)
-        if strict in ['error', 'strict'] and test_status['E']:
-            raise TaskCatException("Exiting due to lint errors")
-        elif strict == 'strict' and test_status['W']:
-            raise TaskCatException("Exiting due to lint warnings")
-
-    def get_child_templates(self, filename, parent_path=''):
-        """
-        recursively find nested templates given a template path
-
-        :param parent_path:
-        :param filename: string, path to template
-        :return: set of nested template paths
-        """
-        children = set()
-        template = cfnlint.decode.cfn_yaml.load(filename)
-        for resource in template['Resources'].keys():
-            child_name = ''
-            if template['Resources'][resource]['Type'] == "AWS::CloudFormation::Stack":
-                template_url = template['Resources'][resource]['Properties']['TemplateURL']
-                if type(template_url) == dict:
-                    if 'Fn::Sub' in template_url.keys():
-                        if type(template_url['Fn::Sub']) == str:
-                            child_name = template_url['Fn::Sub'].split('}')[-1]
-                        else:
-                            child_name = template_url['Fn::Sub'][0].split('}')[-1]
-                    elif 'Fn::Join' in template_url.keys()[0]:
-                        child_name = template_url['Fn::Join'][1][-1]
-                elif type(template_url) == str:
-                    if 'submodules/' not in template_url:
-                        child_name = '/'.join(template_url.split('/')[-2:])
-            if child_name and not child_name.startswith('submodules/'):
-                if parent_path:
-                    child_name = "%s/%s" % (parent_path, child_name)
-                children.add(child_name)
-                children.union(self.get_child_templates(child_name, parent_path=parent_path))
-        return children
 
     # Set AWS Credentials
     # Set AWS Credentials
@@ -1876,7 +1737,7 @@ class TaskCat(object):
                 stackinfo = CommonTools(stack['StackId']).parse_stack_info()
                 # Get stack resources
                 resource[stackinfo['region']] = (
-                    self.get_resources(
+                    CfnResourceTools(self._boto_client).get_resources(
                         str(stackinfo['stack_name']),
                         str(stackinfo['region'])
                     )
@@ -1983,11 +1844,6 @@ class TaskCat(object):
             action='store_true',
             help="Enables verbosity")
         parser.add_argument(
-            '-m',
-            '--multithread_upload',
-            action='store_true',
-            help="Enables multithreaded upload to S3")
-        parser.add_argument(
             '-t',
             '--tag',
             action=AppendTag,
@@ -2001,15 +1857,23 @@ class TaskCat(object):
         parser.add_argument(
             '-l',
             '--lint',
-            type=str,
-            default="warn",
-            help="set linting 'strict' - will fail on errors and warnings, 'error' will fail on errors or 'warn' will "
-                 "log errors to the console, but not fail")
+            action='store_true',
+            help="lint the templates and exit")
         parser.add_argument(
             '-V',
             '--version',
             action='store_true',
             help="Prints Version")
+        parser.add_argument(
+            '-u',
+            '--upload-only',
+            action='store_true',
+            help="Sync local files with s3 and exit")
+        parser.add_argument(
+            '-b',
+            '--lambda-build-only',
+            action='store_true',
+            help="create lambda zips and exit")
 
         args = parser.parse_args()
 
@@ -2022,13 +1886,16 @@ class TaskCat(object):
             print(get_installed_version())
             exit0()
 
+        if args.upload_only:
+            self.upload_only = True
+
+        if args.lambda_build_only:
+            self.lambda_build_only = True
+
         if not args.config_yml:
             parser.error("-c (--config_yml) not passed (Config File Required!)")
             print(parser.print_help())
             raise TaskCatException("-c (--config_yml) not passed (Config File Required!)")
-
-        if args.multithread_upload:
-            self.multithread_upload = True
 
         try:
             self.tags = args.tags
